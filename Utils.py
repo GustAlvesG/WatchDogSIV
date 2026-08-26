@@ -34,20 +34,23 @@ class Utils():
     def log(msg, level="info"):
         getattr(_logger, level, _logger.info)(msg)
 
-    # Função que interpreta o caminho do arquivo criado e monta a query SQL parametrizada
+    # Função que interpreta o caminho do arquivo criado e monta a query SQL parametrizada.
+    # O caminho relativo é calculado a partir do FOLDER_PATH configurado (a raiz monitorada),
+    # ao invés de procurar uma string fixa como "LPR" no caminho — isso evita quebrar por
+    # diferença de maiúsculas/minúsculas ou pelo nome do ponto de montagem variar entre
+    # ambientes (ex: //192.168.10.3/lpr no Windows vs /mnt/lpr no Linux).
     @staticmethod
     def filter_sql_created_file(file_path: str):
         try:
-            if 'LPR' not in file_path:
-                raise Exception("Erro no filtro do caminho.")
+            folder = os.getenv("FOLDER_PATH")
+            if not folder:
+                raise Exception("FOLDER_PATH não configurado.")
 
-            path = file_path.split('LPR', 1)[1]
-            path = path[1:]
-            subpath = path.split(os.sep)
-            if len(subpath) < 2:
-                # Tenta com barra normal, caso o separador do SO seja diferente do usado no caminho recebido
-                subpath = path.replace("\\", "/").split("/")
+            rel = os.path.relpath(file_path, folder)
+            if rel.startswith(".."):
+                raise Exception(f"Arquivo fora da pasta monitorada: {file_path}")
 
+            subpath = rel.replace("\\", "/").split("/")
             if len(subpath) < 2:
                 raise Exception("Erro no filtro do caminho.")
 
@@ -63,7 +66,7 @@ class Utils():
             gate = date_and_color[2].replace(".vehicleBody.jpg", "").replace(".jpg", "")
 
             keys = ["plate", "color", "entry_date", "file", "gate"]
-            values = [plate, color, date, path.replace("\\", "/"), gate]
+            values = [plate, color, date, rel.replace("\\", "/"), gate]
             return Utils.mount_sql(keys, values)
         except Exception as e:
             Utils.log(f"Erro filter_sql_created_file(): {e}", level="error")
