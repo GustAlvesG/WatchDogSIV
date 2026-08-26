@@ -1,61 +1,139 @@
-import datetime
+import logging
 import os
+import time
+from logging.handlers import RotatingFileHandler
+
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
+# Configuração central de logging (com rotação, para o serviço não crescer para sempre em log.log)
+_logger = logging.getLogger("watchdog_lpr")
+if not _logger.handlers:
+    _logger.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+
+    _formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    _file_handler = RotatingFileHandler(
+        os.getenv("LOG_FILE", "log.log"),
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(_formatter)
+    _logger.addHandler(_file_handler)
+
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(_formatter)
+    _logger.addHandler(_console_handler)
+
 
 class Utils():
 
     # Função para registrar logs
     @staticmethod
-    def log(msg):
-        now = datetime.datetime.now()
-        with open("log.log", "a") as file:
-            file.write(f"{now} - {msg}\n")
-        print(f"{now} - {msg}")
+    def log(msg, level="info"):
+        getattr(_logger, level, _logger.info)(msg)
 
-    # Função que será executada quando houver modificações
+    # Função que interpreta o caminho do arquivo criado e monta a query SQL parametrizada
     @staticmethod
     def filter_sql_created_file(file_path: str):
         try:
-            if 'LPR' in file_path:
-                path = file_path.split(fr'LPR', 1)[1]
-                path = path[1:]
-                subpath = path.split('\\')
-        
-                if len(subpath) >= 2:
-                    plate = subpath[0]
-                    date_and_color = subpath[1].split('&')
-        
-                    if len(date_and_color) >= 2:
-                        date = date_and_color[0]
-                        color = date_and_color[1].replace(".vehicleBody.jpg", "")
-                        return Utils.mount_sql(["plate", "color", "entry_date", "file"], [plate, color, date, path.replace("\\", "/")])
-                    else:
-                        raise Exception("Data e cor em formato incorretos.")
-                else:
-                    raise Exception("Erro no filtro do caminho.")
-            else:
+            if 'LPR' not in file_path:
                 raise Exception("Erro no filtro do caminho.")
+
+            path = file_path.split('LPR', 1)[1]
+            path = path[1:]
+            subpath = path.split(os.sep)
+            if len(subpath) < 2:
+                # Tenta com barra normal, caso o separador do SO seja diferente do usado no caminho recebido
+                subpath = path.replace("\\", "/").split("/")
+
+            if len(subpath) < 2:
+                raise Exception("Erro no filtro do caminho.")
+
+            plate = subpath[0]
+            date_and_color = subpath[1].split('&')
+
+            # Precisamos de 3 campos: data, cor e portão (gate)
+            if len(date_and_color) < 3:
+                raise Exception("Data, cor e/ou portão em formato incorreto.")
+
+            date = date_and_color[0]
+            color = date_and_color[1]
+            gate = date_and_color[2].replace(".vehicleBody.jpg", "").replace(".jpg", "")
+
+            keys = ["plate", "color", "entry_date", "file", "gate"]
+            values = [plate, color, date, path.replace("\\", "/"), gate]
+            return Utils.mount_sql(keys, values)
         except Exception as e:
-            Utils.log(f"Erro filter_sql_created_file(): {e}")
+            Utils.log(f"Erro filter_sql_created_file(): {e}", level="error")
             return None
 
-    # Função que envia os valores para o banco de dados
+    # Função que monta a query SQL de forma parametrizada (evita SQL injection e problemas de quoting)
     @staticmethod
-    def mount_sql(keys:tuple[str], values:tuple[str]):
+    def mount_sql(keys: list, values: list):
         try:
-            # Monta a query SQL
-            sql = f"INSERT INTO parkings ({', '.join(keys)}) VALUES ({', '.join([f'"{value}"' for value in values])})"
-            sql = sql.replace('.vehicleBody', '')
+            placeholders = ', '.join(['%s'] * len(values))
+            sql = f"INSERT INTO parkings (" + ', '.join(keys) + f") VALUES ({placeholders});"
         except Exception as e:
-            Utils.log(f"Erro mount_sql(): {e}")
+            Utils.log(f"Erro mount_sql(): {e}", level="error")
+            return None
         else:
-            return sql
-        
-    # Função para renomear um arquivo
+            return sql, tuple(values)
+
+    # Função para renomear um arquivo, com pequenas tentativas de retry
+    # (o arquivo pode ainda estar sendo escrito/travado pelo equipamento de LPR no instante do evento)
     @staticmethod
-    def rename_file(old_name: str, new_name: str):
+    def rename_file(old_name: str, new_name: str, retries: int = 5, delay: float = 1.0):
+        for attempt in range(1, retries + 1):
+            try:
+                os.rename(old_name, new_name)
+            except FileNotFoundError:
+                Utils.log(f"Erro rename_file(): arquivo não encontrado - {old_name}", level="error")
+                return False
+            except Exception as e:
+                if attempt == retries:
+                    Utils.log(f"Erro rename_file(): {e}", level="error")
+                    return False
+                time.sleep(delay)
+            else:
+                return True
+        return False
+
+    # Remove arquivos com mais de `retention_days` dias e diretórios vazios dentro de `folder`.
+    # Um erro em um arquivo/pasta específico não interrompe a limpeza dos demais.
+    @staticmethod
+    def clear_old_files(folder: str, retention_days: int):
+        if not folder or not os.path.isdir(folder):
+            Utils.log(f"clear_old_files(): pasta inválida ou indisponível '{folder}'.", level="error")
+            return
+
+        removed = 0
+        cutoff = time.time() - retention_days * 24 * 60 * 60
+
         try:
-            os.rename(old_name, new_name)
+            for root, dirs, files in os.walk(folder, topdown=False):
+                for file in files:
+                    path = os.path.join(root, file)
+                    try:
+                        # mtime (última modificação) é usado ao invés de ctime: no Linux o ctime
+                        # também muda com qualquer alteração de metadado (ex: o rename feito após
+                        # processar o arquivo), o que "zeraria" a idade do arquivo indevidamente.
+                        if os.path.getmtime(path) < cutoff or file == 'Thumbs.db':
+                            os.remove(path)
+                            removed += 1
+                    except FileNotFoundError:
+                        continue
+                    except Exception as e:
+                        Utils.log(f"Erro ao remover arquivo '{path}': {e}", level="error")
+
+                # Verifica se a pasta ficou vazia e remove (nunca remove a pasta raiz monitorada)
+                try:
+                    if root != folder and not os.listdir(root):
+                        os.rmdir(root)
+                except Exception as e:
+                    Utils.log(f"Erro ao remover pasta '{root}': {e}", level="error")
         except Exception as e:
-            Utils.log(f"Erro rename_file(): {e}")
+            Utils.log(f"Erro clear_old_files(): {e}", level="error")
         else:
-            return True
+            Utils.log(f"Limpeza concluída: {removed} arquivo(s) removido(s) (retenção de {retention_days} dias).")

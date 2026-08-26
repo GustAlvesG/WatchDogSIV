@@ -1,0 +1,24 @@
+[Unit]
+Description=WatchDog LPR - monitoramento de placas e limpeza automatica
+# remote-fs.target garante que o compartilhamento de rede (FOLDER_PATH) já foi
+# montado antes do serviço subir.
+After=network-online.target remote-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ajuste User/Group e os caminhos abaixo conforme o servidor de destino.
+User=watchdog
+Group=watchdog
+WorkingDirectory=/opt/watchdog_lpr
+EnvironmentFile=/opt/watchdog_lpr/.env
+ExecStart=/opt/watchdog_lpr/venv/bin/python /opt/watchdog_lpr/WatchDog.py
+Restart=on-failure
+RestartSec=10
+
+# systemd envia SIGTERM no stop; o WatchDog.py trata esse sinal para um encerramento limpo.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
