@@ -6,6 +6,14 @@ from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
+# Sufixo que o equipamento de LPR usa nos arquivos ainda não processados. Ele é removido
+# do nome do arquivo depois que o registro é inserido no banco.
+PENDING_MARK = ".vehicleBody"
+
+# Idade mínima (em segundos) para remover uma pasta vazia na limpeza. Evita apagar a pasta
+# de uma placa que o equipamento acabou de criar e ainda não recebeu a foto.
+EMPTY_DIR_MIN_AGE_SECONDS = 3600
+
 # Configuração central de logging (com rotação, para o serviço não crescer para sempre em log.log)
 _logger = logging.getLogger("watchdog_lpr")
 if not _logger.handlers:
@@ -35,14 +43,13 @@ class Utils():
         getattr(_logger, level, _logger.info)(msg)
 
     # Função que interpreta o caminho do arquivo criado e monta a query SQL parametrizada.
-    # O caminho relativo é calculado a partir do FOLDER_PATH configurado (a raiz monitorada),
-    # ao invés de procurar uma string fixa como "LPR" no caminho — isso evita quebrar por
-    # diferença de maiúsculas/minúsculas ou pelo nome do ponto de montagem variar entre
-    # ambientes (ex: //192.168.10.3/lpr no Windows vs /mnt/lpr no Linux).
+    # O caminho relativo é calculado a partir da raiz monitorada (`folder`, por padrão o
+    # FOLDER_PATH configurado), que deve conter diretamente as pastas de placa:
+    #   <folder>/<PLACA>/<DATA>&<COR>&<PORTÃO>.vehicleBody.jpg
     @staticmethod
-    def filter_sql_created_file(file_path: str):
+    def filter_sql_created_file(file_path: str, folder: str = None):
         try:
-            folder = os.getenv("FOLDER_PATH")
+            folder = folder or os.getenv("FOLDER_PATH")
             if not folder:
                 raise Exception("FOLDER_PATH não configurado.")
 
@@ -50,7 +57,11 @@ class Utils():
             if rel.startswith(".."):
                 raise Exception(f"Arquivo fora da pasta monitorada: {file_path}")
 
-            subpath = rel.replace("\\", "/").split("/")
+            # O banco guarda o nome final do arquivo (sem o sufixo .vehicleBody), que é o
+            # nome que ele terá depois de renomeado.
+            rel = rel.replace("\\", "/").replace(PENDING_MARK, "")
+
+            subpath = rel.split("/")
             if len(subpath) < 2:
                 raise Exception("Erro no filtro do caminho.")
 
@@ -63,13 +74,13 @@ class Utils():
 
             date = date_and_color[0]
             color = date_and_color[1]
-            gate = date_and_color[2].replace(".vehicleBody.jpg", "").replace(".jpg", "")
+            gate = date_and_color[2].replace(".jpg", "")
 
             keys = ["plate", "color", "entry_date", "file", "gate"]
-            values = [plate, color, date, rel.replace("\\", "/"), gate]
+            values = [plate, color, date, rel, gate]
             return Utils.mount_sql(keys, values)
         except Exception as e:
-            Utils.log(f"Erro filter_sql_created_file(): {e}", level="error")
+            Utils.log(f"Erro filter_sql_created_file(): {e} - {file_path}", level="error")
             return None
 
     # Função que monta a query SQL de forma parametrizada (evita SQL injection e problemas de quoting)
@@ -85,7 +96,6 @@ class Utils():
             return sql, tuple(values)
 
     # Função para renomear um arquivo, com pequenas tentativas de retry
-    # (o arquivo pode ainda estar sendo escrito/travado pelo equipamento de LPR no instante do evento)
     @staticmethod
     def rename_file(old_name: str, new_name: str, retries: int = 5, delay: float = 1.0):
         for attempt in range(1, retries + 1):
@@ -103,26 +113,32 @@ class Utils():
                 return True
         return False
 
-    # Remove arquivos com mais de `retention_days` dias e diretórios vazios dentro de `folder`.
+    # Remove imagens com mais de `retention_days` dias e diretórios vazios dentro de `folder`.
+    # Só arquivos com as extensões informadas são removidos, para que um FOLDER_PATH apontando
+    # para a pasta errada não apague outros tipos de arquivo.
     # Um erro em um arquivo/pasta específico não interrompe a limpeza dos demais.
     @staticmethod
-    def clear_old_files(folder: str, retention_days: int):
+    def clear_old_files(folder: str, retention_days: int, extensions: tuple = (".jpg", ".jpeg")):
         if not folder or not os.path.isdir(folder):
             Utils.log(f"clear_old_files(): pasta inválida ou indisponível '{folder}'.", level="error")
             return
 
         removed = 0
-        cutoff = time.time() - retention_days * 24 * 60 * 60
+        now = time.time()
+        cutoff = now - retention_days * 24 * 60 * 60
+        dir_cutoff = now - EMPTY_DIR_MIN_AGE_SECONDS
 
         try:
             for root, dirs, files in os.walk(folder, topdown=False):
                 for file in files:
+                    if not file.lower().endswith(extensions):
+                        continue
                     path = os.path.join(root, file)
                     try:
                         # mtime (última modificação) é usado ao invés de ctime: no Linux o ctime
                         # também muda com qualquer alteração de metadado (ex: o rename feito após
                         # processar o arquivo), o que "zeraria" a idade do arquivo indevidamente.
-                        if os.path.getmtime(path) < cutoff or file == 'Thumbs.db':
+                        if os.path.getmtime(path) < cutoff:
                             os.remove(path)
                             removed += 1
                     except FileNotFoundError:
@@ -132,8 +148,10 @@ class Utils():
 
                 # Verifica se a pasta ficou vazia e remove (nunca remove a pasta raiz monitorada)
                 try:
-                    if root != folder and not os.listdir(root):
+                    if root != folder and not os.listdir(root) and os.path.getmtime(root) < dir_cutoff:
                         os.rmdir(root)
+                except FileNotFoundError:
+                    continue
                 except Exception as e:
                     Utils.log(f"Erro ao remover pasta '{root}': {e}", level="error")
         except Exception as e:

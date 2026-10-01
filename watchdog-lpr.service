@@ -1,8 +1,6 @@
 [Unit]
 Description=WatchDog LPR - monitoramento de placas e limpeza automatica
-# remote-fs.target garante que o compartilhamento de rede (FOLDER_PATH) já foi
-# montado antes do serviço subir.
-After=network-online.target remote-fs.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
@@ -13,6 +11,8 @@ Group=watchdog
 WorkingDirectory=/opt/watchdog_lpr
 EnvironmentFile=/opt/watchdog_lpr/.env
 ExecStart=/opt/watchdog_lpr/venv/bin/python /opt/watchdog_lpr/WatchDog.py
+# O WatchDog.py sai com código diferente de zero em caso de erro (ex: pasta ou
+# configuração indisponível), o que faz o systemd reiniciá-lo.
 Restart=on-failure
 RestartSec=10
 

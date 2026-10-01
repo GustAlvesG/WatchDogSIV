@@ -1,11 +1,23 @@
 # Importando as bibliotecas necessárias
 import os
 import mysql.connector as mysql
+from mysql.connector import errorcode
 from Utils import Utils
 
 # Carregando as variáveis de ambiente
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+# Tempo máximo (em segundos) para estabelecer a conexão. Sem isso, um banco inacessível
+# poderia travar o serviço indefinidamente.
+CONNECTION_TIMEOUT_SECONDS = 10
+
+
+# Erro levantado quando o banco está inacessível (falha de conexão/rede). Diferente de um
+# erro nos dados, a mesma operação pode ser repetida mais tarde.
+class DatabaseUnavailable(Exception):
+    pass
+
 
 # Classe para gerenciar a conexão com o banco de dados
 class Database():
@@ -27,19 +39,24 @@ class Database():
             host=self.host,
             user=self.user,
             password=self.password,
-            database=self.database
+            database=self.database,
+            connection_timeout=CONNECTION_TIMEOUT_SECONDS
         )
         # Criando um cursor para executar consultas SQL
         self.cursor = self.connection.cursor()
 
     # Método para executar uma consulta SQL. `params` permite queries parametrizadas
     # (evita SQL injection e problemas de escaping/quoting de valores string).
+    # Levanta DatabaseUnavailable se o banco estiver inacessível.
     def execute(self, sql: str, type, params: tuple = None):
         if not sql:
             return None
         try:
             # Conectando ao banco de dados
-            self.connect()
+            try:
+                self.connect()
+            except mysql.Error as e:
+                raise DatabaseUnavailable(str(e)) from e
             # Executando a consulta
             self.cursor.execute(sql, params)
             if type == "select":
@@ -51,7 +68,17 @@ class Database():
             elif type == "one":
                 # Retornando o primeiro resultado
                 return self.fetchone()
+        except DatabaseUnavailable:
+            raise
+        except (mysql.InterfaceError, mysql.OperationalError) as e:
+            # Conexão perdida no meio da operação
+            raise DatabaseUnavailable(str(e)) from e
         except Exception as e:
+            # Registro que já existe (tabela com índice UNIQUE): o insert já foi feito antes,
+            # então é tratado como sucesso para o arquivo poder ser finalizado.
+            if type == "insert" and getattr(e, "errno", None) == errorcode.ER_DUP_ENTRY:
+                Utils.log(f"Registro já existente no banco, insert ignorado: {params}")
+                return True
             Utils.log(f"Erro execute(): {e}", level="error")
             # Rollback em caso de erro (somente se a conexão chegou a ser estabelecida)
             if self.connection is not None:
