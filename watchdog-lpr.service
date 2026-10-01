@@ -11,14 +11,15 @@ Group=watchdog
 WorkingDirectory=/opt/watchdog_lpr
 EnvironmentFile=/opt/watchdog_lpr/.env
 ExecStart=/opt/watchdog_lpr/venv/bin/python /opt/watchdog_lpr/WatchDog.py
-# O WatchDog.py sai com código diferente de zero em caso de erro (ex: pasta ou
-# configuração indisponível), o que faz o systemd reiniciá-lo.
 Restart=on-failure
 RestartSec=10
+# Código 2 = erro de configuração no .env (ex: FTP_HOST ausente): reiniciar não resolve.
+RestartPreventExitStatus=2
 
 # systemd envia SIGTERM no stop; o WatchDog.py trata esse sinal para um encerramento limpo.
+# O tempo de parada cobre uma operação de FTP em andamento (FTP_TIMEOUT_SECONDS).
 KillSignal=SIGTERM
-TimeoutStopSec=30
+TimeoutStopSec=60
 
 [Install]
 WantedBy=multi-user.target

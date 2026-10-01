@@ -1,80 +1,85 @@
 # WatchDog LPR
 
-Serviço que monitora a pasta onde o equipamento de LPR (leitura de placas) grava, via
-FTP, as fotos dos veículos, insere os registros (placa, cor, data e portão) em um banco
-MySQL e remove periodicamente as imagens com mais de `RETENTION_DAYS` dias.
+Serviço que se conecta ao servidor FTP onde o equipamento de LPR (leitura de placas)
+grava as fotos dos veículos, insere os registros (placa, cor, data e portão) em um banco
+MySQL e remove periodicamente do FTP as imagens com mais de `RETENTION_DAYS` dias.
+
+Os arquivos nunca são baixados: tudo é feito no próprio servidor FTP (listar, renomear
+e apagar).
 
 ## Estrutura
 
-- `WatchDog.py` — ponto de entrada: loop de varredura da pasta e de limpeza periódica.
-- `Scanner.py` — procura os arquivos pendentes, faz a inserção no banco e renomeia.
-- `Utils.py` — parsing do caminho/SQL, logging (com rotação) e limpeza de arquivos antigos.
+- `WatchDog.py` — ponto de entrada: loop de varredura do FTP e de limpeza periódica.
+- `Scanner.py` — procura os arquivos pendentes, faz a inserção no banco, renomeia e limpa.
+- `Ftp.py` — conexão com o servidor FTP.
 - `Database.py` — conexão com o MySQL.
+- `Utils.py` — parsing do caminho/SQL e logging (com rotação).
 - `tests/` — testes unitários.
 
 ## Como funciona
 
-O equipamento de LPR envia as fotos por FTP para o próprio servidor onde o serviço roda,
-dentro da pasta `FOLDER_PATH`, neste formato:
+Dentro da pasta `FTP_PATH` do servidor FTP, as fotos devem estar neste formato:
 
 ```
-<FOLDER_PATH>/<PLACA>/<DATA>&<COR>&<PORTÃO>.vehicleBody.jpg
+<PLACA>/<DATA>&<COR>&<PORTÃO>.vehicleBody.jpg
 ```
 
-A cada `SCAN_INTERVAL_SECONDS` o serviço varre a pasta atrás de arquivos
+A cada `SCAN_INTERVAL_SECONDS` o serviço lista o FTP atrás de arquivos
 `.vehicleBody.jpg`. Para cada um, insere o registro na tabela `parkings` e renomeia o
-arquivo removendo o `.vehicleBody`. A coluna `file` guarda o caminho já com o nome
-final (ex: `QXA4C30/2026-08-26T09-54-58&Prata&A.jpg`).
+arquivo no FTP removendo o `.vehicleBody`. A coluna `file` guarda o caminho já com o
+nome final (ex: `QXA4C30/2026-08-26T09-54-58&Prata&A.jpg`).
 
 O sufixo `.vehicleBody` é, portanto, o controle de pendência:
 
-- Um arquivo só é processado depois de ficar `FILE_SETTLE_SECONDS` sem ser modificado,
-  para não pegar uma foto cujo upload ainda está em andamento.
-- Se o banco estiver fora do ar, o arquivo continua pendente e é tentado de novo na
-  próxima varredura (não é preciso reiniciar o serviço).
+- Um arquivo só é processado quando o tamanho dele é o mesmo em duas varreduras
+  seguidas, para não pegar uma foto cujo envio ainda está em andamento.
+- Se o FTP ou o banco estiverem fora do ar, o arquivo continua pendente e é tentado de
+  novo na próxima varredura (não é preciso reiniciar o serviço).
 - Um arquivo com nome fora do padrão, ou recusado pelo banco, é registrado no log uma
   vez e ignorado até o serviço reiniciar.
+
+Quando o servidor FTP informa a data de modificação das pastas (comando MLSD), só as
+pastas de placa que mudaram são listadas a cada varredura, com uma varredura completa a
+cada 5 minutos. Em servidores sem MLSD todas as pastas são listadas a cada varredura.
 
 Opcionalmente, um índice `UNIQUE` na coluna `file` da tabela `parkings` garante no
 próprio banco que uma foto nunca seja registrada duas vezes; o serviço trata o erro de
 duplicidade como "já inserido" e apenas finaliza o arquivo.
 
+## Configuração (`.env`)
+
+| Variável | Descrição |
+|---|---|
+| `FTP_HOST` | Endereço do servidor FTP. |
+| `FTP_PORT` | Porta do servidor FTP (padrão 21). |
+| `FTP_USERNAME` / `FTP_PASSWORD` | Usuário e senha. Precisa de permissão para listar, renomear e apagar. |
+| `FTP_PATH` | Pasta, dentro do servidor, que contém diretamente as pastas de placa (padrão `/`). |
+| `FTP_PASSIVE` | Modo passivo (padrão `true`). |
+| `FTP_TLS` | `true` para FTP sobre TLS (FTPS explícito). Padrão `false`. |
+| `FTP_TIMEOUT_SECONDS` | Tempo máximo de espera por resposta do servidor (padrão 30). |
+| `FTP_ENCODING` | Codificação dos nomes de arquivo (padrão `utf-8`; use `latin-1` se o servidor não trabalhar em UTF-8). |
+| `DB_HOST`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD` | Conexão com o MySQL. |
+| `SCAN_INTERVAL_SECONDS` | Intervalo entre as varreduras (padrão 5). |
+| `RETENTION_DAYS`, `CLEANUP_INTERVAL_SECONDS`, `CLEANUP_EXTENSIONS` | Limpeza automática (veja abaixo). |
+| `LOG_LEVEL`, `LOG_FILE` | Logging. |
+
 ## Deploy em servidor Linux
 
 1. Copie o projeto para o servidor (ex: `/opt/watchdog_lpr`).
-2. Execute o instalador como root (instala e configura o servidor FTP, cria o venv,
-   instala dependências, gera `.env` e o serviço systemd):
+2. Execute o instalador como root (cria o venv, instala dependências, gera `.env` e o
+   serviço systemd):
 
    ```bash
    sudo ./install.sh
    ```
 
-   O script vai pedir (ou usar variáveis de ambiente já exportadas — veja abaixo) o
-   usuário e a senha FTP que o equipamento vai usar e a pasta onde as imagens serão
-   gravadas (ex: `/srv/lpr`). Ele instala o `vsftpd`, cria o usuário (sem acesso a
-   shell e preso a essa pasta), libera o login por FTP somente para ele, coloca o
-   usuário do serviço no grupo do usuário FTP (para poder renomear e apagar os arquivos)
-   e já ajusta `FOLDER_PATH` no `.env`.
-
-   Para automatizar sem prompts (ex: em provisionamento), exporte antes de rodar:
+   Para instalar só o venv/dependências/`.env`, sem o serviço e sem precisar de root:
 
    ```bash
-   export FTP_USER=lpr
-   export FTP_PASSWORD=senha_ftp
-   export FTP_DIR=/srv/lpr
-   sudo -E ./install.sh
+   ./install.sh --no-service
    ```
 
-   Flags disponíveis:
-
-   ```bash
-   sudo ./install.sh --no-ftp        # pula o servidor FTP (já configurado por fora)
-   sudo ./install.sh --no-service    # pula a instalação do serviço systemd
-   ./install.sh --no-ftp --no-service   # só venv/deps/.env, sem precisar de root
-   ```
-
-3. Confira/edite `.env` com os demais dados reais (`DB_HOST`, `DB_DATABASE`,
-   `DB_USERNAME`, `DB_PASSWORD`, etc. — veja `.env.example`).
+3. Edite o `.env` com os dados do servidor FTP e do banco (veja a tabela acima).
 4. Inicie o serviço:
 
    ```bash
@@ -83,25 +88,22 @@ duplicidade como "já inserido" e apenas finaliza o arquivo.
    journalctl -u watchdog-lpr -f
    ```
 
-5. Configure o equipamento de LPR para enviar as imagens por FTP para o servidor:
-   porta 21, o usuário e a senha definidos na instalação e a pasta raiz (`/`), que
-   corresponde a `FOLDER_PATH`. As pastas de placa devem ficar diretamente na raiz.
-
-   Se houver firewall no servidor, libere a porta 21 e a faixa do modo passivo
-   (40000-40100 por padrão; ajustável com `FTP_PASV_MIN_PORT`/`FTP_PASV_MAX_PORT`).
-
-   O FTP trafega usuário, senha e imagens sem criptografia: mantenha o equipamento e o
-   servidor na mesma rede interna.
-
 ## Limpeza automática
 
-A cada `CLEANUP_INTERVAL_SECONDS` (padrão 1h) o serviço remove as imagens com mais de
-`RETENTION_DAYS` dias (padrão 15) e as pastas que ficaram vazias. Só arquivos com as
-extensões de `CLEANUP_EXTENSIONS` (padrão `.jpg,.jpeg`) são apagados; `RETENTION_DAYS=0`
-desativa a limpeza.
+A cada `CLEANUP_INTERVAL_SECONDS` (padrão 1h) o serviço remove do FTP as imagens com
+mais de `RETENTION_DAYS` dias (padrão 15). A idade é calculada pela data que está no
+nome do arquivo; se o nome não seguir o padrão, pela data de modificação informada pelo
+servidor. Só arquivos com as extensões de `CLEANUP_EXTENSIONS` (padrão `.jpg,.jpeg`) são
+apagados; `RETENTION_DAYS=0` desativa a limpeza.
+
+Uma pasta de placa vazia só é removida se continuar vazia em duas limpezas seguidas,
+para não apagar a pasta de uma placa recém-criada que ainda não recebeu a foto.
 
 ## Testes
 
 ```bash
 ./venv/bin/python -m unittest discover -s tests -t .
 ```
+
+Os testes de `Ftp.py` sobem um servidor FTP local e só rodam com o `pyftpdlib`
+instalado (`./venv/bin/pip install pyftpdlib`); sem ele, são pulados.
